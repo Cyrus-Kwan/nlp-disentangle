@@ -7,7 +7,7 @@ class SBERTDiscriminator(nn. Module):
 
         self.mlp = nn.Sequential(
             nn.Linear(cfg.bert_dim, cfg.disc_dim),
-            nn.PRELU(cfg.disc_dim),
+            nn.PReLU(cfg.disc_dim),
             nn.Linear(cfg.disc_dim, cfg.disc_dim)
         )
 
