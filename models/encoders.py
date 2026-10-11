@@ -29,14 +29,14 @@ class ContentEncoder(nn. Module):
         return self.mlp(x)
 
 
-class ResidualEncoder(nn. Module):
+class ContextEncoder(nn. Module):
     def __init__(self, cfg):
         super().__init__()
 
         self.mlp = nn.Sequential(
-            nn.Linear(cfg.bert_dim, cfg.residual_dim),
+            nn.Linear(cfg.bert_dim, cfg.context_dim),
             nn.GELU(),
-            nn.Linear(cfg.residual_dim, cfg.residual_dim)
+            nn.Linear(cfg.context_dim, cfg.context_dim)
         )
 
     def forward(self, x):
