@@ -148,32 +148,32 @@ def train_iteration(
         optim_D.zero_grad(set_to_none=True)
 
         with torch.no_grad():
-            fake_embeds = make_generated_embeds(
+            pair_embeds = make_generated_embeds(
                 model, human, agent
             )
 
-        real_embeds = torch.cat([human, agent], dim=0)
+        true_embeds = torch.cat([human, agent], dim=0)
 
-        real_logits = model.discriminator(real_embeds)
-        fake_logits = model.discriminator(fake_embeds)
+        true_logits = model.discriminator(true_embeds)
+        pair_logits = model.discriminator(pair_embeds)
 
-        real_labels = torch.ones_like(real_logits)
-        fake_labels = torch.zeros_like(fake_logits)
+        true_labels = torch.ones_like(true_logits)
+        pair_labels = torch.zeros_like(pair_logits)
 
         loss_D_real = F.binary_cross_entropy_with_logits(
-            real_logits, real_labels
+            true_logits, true_labels
         )
         loss_D_fake = F.binary_cross_entropy_with_logits(
-            fake_logits, fake_labels
+            pair_logits, pair_labels
         )
 
         loss_D = 0.5 * (loss_D_real + loss_D_fake)
 
         # Measure D's predictive performance before its update.
         with torch.no_grad():
-            real_acc = ((real_logits >= 0).float().mean())
-            fake_acc = ((fake_logits < 0).float().mean())
-            disc_acc = 0.5 * (real_acc + fake_acc)
+            true_acc = ((true_logits >= 0).float().mean())
+            pair_acc = ((pair_logits < 0).float().mean())
+            disc_acc = 0.5 * (true_acc + pair_acc)
 
         loss_D.backward()
 
@@ -216,12 +216,12 @@ def train_iteration(
 
             # Adversarial objective: generated embeddings
             # should be classified as real.
-            fake_embeds = make_generated_embeds(model, human, agent)
+            pair_embeds = make_generated_embeds(model, human, agent)
 
-            fake_logits = model.discriminator(fake_embeds)
-            real_targets = torch.ones_like(fake_logits)
+            pair_logits     = model.discriminator(pair_embeds)
+            true_targets    = torch.ones_like(pair_logits)
 
-            loss_adv = F.binary_cross_entropy_with_logits(fake_logits, real_targets)
+            loss_adv = F.binary_cross_entropy_with_logits(pair_logits, true_targets)
 
             loss_G = (self_parts["total_loss"] + lambda_cross * cross_parts["total_loss"] + lambda_adv * loss_adv)
             loss_G.backward()
