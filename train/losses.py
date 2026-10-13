@@ -13,12 +13,48 @@ def compute_content_loss(model, human_embed, agent_embed):
     human_logits = model.content_regressor(human_embed)
     agent_logits = model.content_regressor(agent_embed)
 
-    return F.mse_loss(human_logits, agent_logits)
+    regression_loss = F.mse_loss(human_logits, agent_logits)
+    retrieval_loss  = pair_retrieval_loss(human_embed, agent_embed)
+    total_loss      = regression_loss + retrieval_loss
+
+    return {
+        "total_loss": total_loss,
+        "regression_loss": regression_loss,
+        "retrieval_loss": retrieval_loss
+    }
 
 def compute_context_loss(model, context_embed, question_embed):
     context_logits  = model.context_regressor(context_embed)
+    
+    regression_loss = F.mse_loss(context_logits, question_embed)
+    retrieval_loss  = pair_retrieval_loss(context_embed, question_embed)
+    total_loss      = regression_loss + retrieval_loss
 
-    return F.mse_loss(context_logits, question_embed)
+    return {
+        "total_loss": total_loss,
+        "regression_loss": regression_loss,
+        "retrieval_loss": retrieval_loss
+    }
+
+def pair_retrieval_loss(embed_a, embed_b, temperature=1):
+    if embed_a.size(0) != embed_b.size(0):
+        raise ValueError("Paired batches must have equal sizes.")
+
+    if embed_a.size(0) < 2:
+        raise ValueError("Contrastive retrieval needs at least 2 pairs per batch.")
+
+    a = F.normalize(embed_a, p=2, dim=-1)
+    b = F.normalize(embed_b, p=2, dim=-1)
+
+    # Similarity of every candidate pair.
+    logits  = (a @ b.T) / temperature
+    targets = torch.arange(logits.size(0), device=logits.device)
+
+    # A --> B and B --> A
+    loss_ab = F.cross_entropy(logits, targets)
+    loss_ba = F.cross_entropy(logits.T, targets)
+
+    return (loss_ab + loss_ba) / 2
 
 def reconstruction_loss(model, human_embed, agent_embed, question_embed):
     style_human, content_human, context_human = model.encode(human_embed)
@@ -35,11 +71,11 @@ def reconstruction_loss(model, human_embed, agent_embed, question_embed):
     style_loss          = (human_style_loss + agent_style_loss) / 2
 
     # Content consistency
-    content_loss        = compute_content_loss(model, content_human, content_agent)
+    content_loss        = compute_content_loss(model, content_human, content_agent)["total_loss"]
 
     # Context reconstruction
-    human_context_loss  = compute_context_loss(model, context_human, question_embed)
-    agent_context_loss  = compute_context_loss(model, context_agent, question_embed)
+    human_context_loss  = compute_context_loss(model, context_human, question_embed)["total_loss"]
+    agent_context_loss  = compute_context_loss(model, context_agent, question_embed)["total_loss"]
     context_loss        = (human_context_loss + agent_context_loss) / 2
 
     # Reconstruct the original response embeddings
@@ -98,10 +134,10 @@ def generation_loss(model, human_embed, agent_embed, question_embed):
     ) / 4
 
     # Context reconstruction
-    hah_context_loss = compute_context_loss(model, hah_context, question_embed)
-    aha_context_loss = compute_context_loss(model, aha_context, question_embed)
-    haa_context_loss = compute_context_loss(model, haa_context, question_embed)
-    ahh_context_loss = compute_context_loss(model, ahh_context, question_embed)
+    hah_context_loss = compute_context_loss(model, hah_context, question_embed)["total_loss"]
+    aha_context_loss = compute_context_loss(model, aha_context, question_embed)["total_loss"]
+    haa_context_loss = compute_context_loss(model, haa_context, question_embed)["total_loss"]
+    ahh_context_loss = compute_context_loss(model, ahh_context, question_embed)["total_loss"]
     context_loss = (hah_context_loss + aha_context_loss + haa_context_loss + ahh_context_loss) / 4
 
     # Combine objectives
