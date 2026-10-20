@@ -4,7 +4,9 @@ import torch.nn.functional as F
 from train.pairs import *
 from train.losses import *
 
-def train_step(model, batch, gene_optim, disc_optim):
+def train_step(model, batch, gene_optim, disc_optim, probe_optim):
+    cfg = model.cfg
+
     question_embed  = batch["question"]
     human_embed     = batch["human"]
     agent_embed     = batch["agent"]
@@ -32,14 +34,22 @@ def train_step(model, batch, gene_optim, disc_optim):
     disc_loss.backward()
     disc_optim.step()
 
+    '''Update probes'''
+    probe_optim.zero_grad(set_to_none=True)
+    p_loss = probe_loss(model, human_embed, agent_embed)
+    p_loss["total_loss"].backward()
+    probe_optim.step()
+
     '''Update encoders, generator, and auxiliary heads'''
     for parameter in model.discriminator.parameters():
         parameter.requires_grad_(False)
 
+    set_requires_grad(model.probes, False)
     gene_optim.zero_grad(set_to_none=True)
 
     self_loss   = reconstruction_loss(model, human_embed, agent_embed, question_embed)
     cross_loss  = generation_loss(model, human_embed, agent_embed, question_embed)
+    leak_loss   = confusion_loss(model, human_embed, agent_embed)
 
     # Recompute with gradients enabled for generator training
     gene_embeds = make_generated_embeds(model, human_embed, agent_embed)
@@ -50,6 +60,7 @@ def train_step(model, batch, gene_optim, disc_optim):
     gene_loss   = (
         self_loss["total_loss"] +
         cross_loss["total_loss"] + 
+        cfg.w_leak * leak_loss["total_loss"] +
         adv_loss 
     )
 
@@ -60,12 +71,16 @@ def train_step(model, batch, gene_optim, disc_optim):
     for parameter in model.discriminator.parameters():
         parameter.requires_grad_(True)
 
+    set_requires_grad(model.probes, True)
+
     return{
         "generator_loss": gene_loss.detach().item(), 
         "self_loss": self_loss["total_loss"].detach().item(),
         "cross_loss": cross_loss["total_loss"].detach().item(),
         "adversarial_loss": adv_loss.detach().item(),
-        "discriminator_loss": disc_loss.detach().item()
+        "discriminator_loss": disc_loss.detach().item(),
+        "leak_loss": leak_loss["total_loss"].detach().item(),
+        "probe_loss": p_loss["total_loss"].detach().item()
     }
 
 class AlternatingState:
@@ -131,7 +146,16 @@ class AlternatingState:
 
 
 def train_iteration(
-    model, batch, optim_G, optim_D, state, lambda_cross=1.0, lambda_adv=0.05, grad_clip=5.0,
+    model, 
+    batch, 
+    optim_G, 
+    optim_D, 
+    optim_P, 
+    state, 
+    lambda_cross=1.0, 
+    lambda_adv=0.05, 
+    lambda_leak=1.0, 
+    grad_clip=5.0,
 ):
     logs = {}
 
@@ -139,7 +163,15 @@ def train_iteration(
     human       = batch["human"]
     agent       = batch["agent"]
 
+    cfg = model.cfg
     model.train()
+
+    # PROBE UPDATE (every iteration)
+    optim_P.zero_grad(set_to_none=True)
+    p_loss = probe_loss(model, human, agent)
+    p_loss["total_loss"].backward()
+    optim_P.step()
+    logs["loss_probe"] = p_loss["total_loss"].detach().item()
 
     # ==================================================
     # DISCRIMINATOR UPDATE
@@ -207,12 +239,17 @@ def train_iteration(
         for parameter in model.discriminator.parameters():
             parameter.requires_grad_(False)
 
+        set_requires_grad(model.probes, False)
+
         try:
             # Real-data objectives
             self_parts = reconstruction_loss(model, human, agent, question)
 
             # Factor recombination objectives
             cross_parts = generation_loss(model, human, agent, question)
+
+            # Gradient reversal loss
+            leak_loss   = confusion_loss(model, human, agent)
 
             # Adversarial objective: generated embeddings
             # should be classified as real.
@@ -223,7 +260,12 @@ def train_iteration(
 
             loss_adv = F.binary_cross_entropy_with_logits(pair_logits, true_targets)
 
-            loss_G = (self_parts["total_loss"] + lambda_cross * cross_parts["total_loss"] + lambda_adv * loss_adv)
+            loss_G = (
+                self_parts["total_loss"] + 
+                lambda_cross * cross_parts["total_loss"] + 
+                lambda_leak * leak_loss["total_loss"] + 
+                lambda_adv * loss_adv
+            )
             loss_G.backward()
 
             if grad_clip is not None:
@@ -235,6 +277,8 @@ def train_iteration(
             # Restore D for its next update.
             for parameter in model.discriminator.parameters():
                 parameter.requires_grad_(True)
+
+            set_requires_grad(model.probes, True)
 
         state.record_gen(loss_G.detach().item())
 
