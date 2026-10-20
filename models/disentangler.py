@@ -4,6 +4,7 @@ import torch.nn as nn
 from models.encoders import StyleEncoder, ContentEncoder, ContextEncoder
 from models.generator import SBERTGenerator
 from models.discriminator import SBERTDiscriminator
+from models.probes import Probe
 
 class SBERTDisentangler(nn. Module):
     def __init__(self, cfg):
@@ -22,6 +23,27 @@ class SBERTDisentangler(nn. Module):
         self.content_regressor  = nn.Linear(cfg.content_dim, cfg.content_dim)
         self.context_regressor  = nn.Linear(cfg.context_dim, cfg.question_dim)
 
+        self.probes = nn.ModuleDict()
+
+        in_dims = {
+            "style": cfg.style_dim,
+            "content": cfg.content_dim,
+            "context": cfg.context_dim
+        }
+        out_dims = {
+            "style": cfg.style_out,
+            "content": cfg.content_out,
+            "context": cfg.context_out
+        }
+
+        for i in in_dims:
+            for o in out_dims:
+                if i == o: continue
+                self.probes[f"{i}_{o}"] = Probe(in_dims[i], out_dims[o])
+
+    def probe_parameters(self):
+        return self.probes.parameters()
+
     def generator_parameters(self):
         for module in (
             self.style_encoder,
@@ -30,7 +52,7 @@ class SBERTDisentangler(nn. Module):
             self.generator,
             self.style_classifier,
             self.content_regressor,
-            self.context_regressor
+            self.context_regressor,
         ):
             yield from module.parameters()
 
