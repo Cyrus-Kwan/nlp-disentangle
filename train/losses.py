@@ -16,8 +16,8 @@ def set_requires_grad(module, flag):
 
 
 def _normed_codes(model, human_embed, agent_embed):
-    style_h, content_h, context_h = model.encode(human_embed)
-    style_a, content_a, context_a = model.encode(agent_embed)
+    style_h, content_h, context_h = model.encode(human_embed, sample=False)
+    style_a, content_a, context_a = model.encode(agent_embed, sample=False)
 
     codes = {
         "style":   torch.cat([style_h, style_a], dim=0),
@@ -80,6 +80,19 @@ def pair_align_loss(a, b):
     return F.mse_loss(a, b)
 
 
+def vae_loss(x, recon, mu, logvar, beta=1.0):
+    recon_loss = F.mse_loss(recon, x, reduction="mean")
+    kl_per_example = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=-1)
+    kl_loss = kl_per_example.mean()
+    total_loss = recon_loss + beta * kl_loss
+
+    return {
+        "total_loss": total_loss,
+        "recon_loss": recon_loss,
+        "kl_loss": kl_loss,
+    }
+
+
 def compute_style_loss(model, style_embed, style_labels):
     style_logits    = model.style_classifier(style_embed).squeeze(-1)
 
@@ -90,11 +103,13 @@ def compute_style_loss(model, style_embed, style_labels):
 
 
 def compute_content_loss(model, human_embed, agent_embed):
-    regression_loss = F.mse_loss(
-        model.content_regressor(human_embed), agent_embed.detach()
-    )
+    cfg = model.cfg
+
+    logits_h        = F.mse_loss(model.content_regressor(human_embed), agent_embed.detach())
+    logits_a        = F.mse_loss(model.content_regressor(agent_embed), human_embed.detach())
+    regression_loss = (logits_h + logits_a) / 2
     retrieval_loss  = pair_retrieval_loss(human_embed, agent_embed)
-    total_loss      = regression_loss + retrieval_loss
+    total_loss      = regression_loss + cfg.w_retrieval * retrieval_loss
 
     return {
         "total_loss": total_loss,
@@ -139,60 +154,96 @@ def pair_retrieval_loss(embed_a, embed_b, temperature=0.1):
     return (loss_ab + loss_ba) / 2
 
 
+def kl_divergence(mu, logvar):
+    return -0.5 * (
+        1 + logvar - mu.pow(2) - logvar.exp()
+    ).sum(dim=-1).mean()
+
+
 def reconstruction_loss(model, human_embed, agent_embed, question_embed):
     cfg = model.cfg
-
-    style_human, content_human, context_human = model.encode(human_embed)
-    style_agent, content_agent, context_agent = model.encode(agent_embed)
-
     batch_size = human_embed.size(0)
+    beta_kl = getattr(cfg, "beta_kl", 0.01)
 
-    human_style_label = torch.zeros(batch_size, device=human_embed.device)
-    agent_style_label = torch.ones(batch_size, device=agent_embed.device)
+    # --------------------------------------------------
+    # 1. Individual VAE reconstruction losses
+    # --------------------------------------------------
+    # Style VAE reconstruct human and AI responses.
+    # style_h = vae_loss(human_embed, *model.style_encoder(human_embed)[:3], beta=beta_kl)
+    # style_a = vae_loss(agent_embed, *model.style_encoder(agent_embed)[:3], beta=beta_kl)
+    # style_vae_loss = (style_h["total_loss"] + style_a["total_loss"]) / 2
 
-    # Style classification
-    human_style_loss    = compute_style_loss(model, style_human, human_style_label)
-    agent_style_loss    = compute_style_loss(model, style_agent, agent_style_label)
-    style_loss          = (human_style_loss + agent_style_loss) / 2
+    # # Content VAE: reconstruct response embeddings.
+    # content_h = vae_loss(human_embed, *model.content_encoder(human_embed)[:3], beta=beta_kl)
+    # content_a = vae_loss(agent_embed, *model.content_encoder(agent_embed)[:3], beta=beta_kl)
+    # content_vae_loss = (content_h["total_loss"] + content_a["total_loss"]) / 2
 
-    # Content consistency
-    content_loss        = compute_content_loss(model, content_human, content_agent)["total_loss"]
+    # # Context VAE: reconstruct question embeddings.
+    # context_q = vae_loss(question_embed, *model.context_encoder(question_embed)[:3], beta=beta_kl)
+    # context_vae_loss = context_q["total_loss"]
 
-    # Context reconstruction
-    human_context_loss  = compute_context_loss(model, context_human, question_embed)["total_loss"]
-    agent_context_loss  = compute_context_loss(model, context_agent, question_embed)["total_loss"]
-    context_loss        = (human_context_loss + agent_context_loss) / 2
+    # vae_total   = context_vae_loss
+    # vae_total = (content_vae_loss + context_vae_loss) / 2
+    # # vae_total = (style_vae_loss + content_vae_loss + context_vae_loss) / 3
 
-    # Pair align loss
-    align_loss = (
-        pair_align_loss(content_human, content_agent) + 
-        pair_align_loss(context_human, context_agent)
+    # --------------------------------------------------
+    # 2. Latent codes for disentanglement objectives
+    # --------------------------------------------------
+
+    style_h, content_h, context_h = model.encode(human_embed)
+    style_a, content_a, context_a = model.encode(agent_embed)
+
+    human_labels = torch.zeros(batch_size, device=human_embed.device)
+    agent_labels = torch.ones(batch_size, device=agent_embed.device)
+
+    style_loss = (
+        compute_style_loss(model, style_h, human_labels) + 
+        compute_style_loss(model, style_a, agent_labels)
+    ) / 2
+
+    content_loss = compute_content_loss(model, content_h, content_a)["total_loss"]
+
+    # Context should encode the question, so encode the question
+    # directly rather than treating the response as the question.
+    # _, _, context_question = model.encode(question_embed)
+    h_context_loss = compute_context_loss(model, context_h, question_embed)["total_loss"]
+    a_context_loss = compute_context_loss(model, context_a, question_embed)["total_loss"]
+    context_loss   = (h_context_loss + a_context_loss) / 2
+
+    # --------------------------------------------------
+    # 3. Combined-generator reconstruction
+    # --------------------------------------------------
+
+    human_recon = model.generate(style_h, content_h, context_h)
+    agent_recon = model.generate(style_a, content_a, context_a)
+
+    reconstruct_loss = 0.5 * (
+        F.mse_loss(human_recon, human_embed) + 
+        F.mse_loss(agent_recon, agent_embed)
     )
-    
 
-    # Reconstruct the original response embeddings
-    human_reconstruct, *_   = model.reconstruct(human_embed)
-    agent_reconstruct, *_   = model.reconstruct(agent_embed)
-    reconstruct_loss        = 0.5 * (
-        F.mse_loss(human_reconstruct, human_embed) +
-        F.mse_loss(agent_reconstruct, agent_embed)
-    )
+    # --------------------------------------------------
+    # 4. Combine objectives
+    # --------------------------------------------------
 
-    # Combine objectives
-    total_loss  = (
+    total_loss = (
+        # vae_total + 
         cfg.w_style * style_loss + 
         cfg.w_content * content_loss + 
         cfg.w_context * context_loss + 
-        cfg.w_recon * reconstruct_loss +
-        cfg.w_align * align_loss
+        cfg.w_recon * reconstruct_loss
     )
 
     return {
         "total_loss": total_loss,
+        # "vae_loss": vae_total,
+        # "style_vae_loss": style_vae_loss,
+        # "content_vae_loss": content_vae_loss,
+        # "context_vae_loss": context_vae_loss,
         "style_loss": style_loss,
         "content_loss": content_loss,
         "context_loss": context_loss,
-        "reconstruct_loss": reconstruct_loss
+        "reconstruct_loss": reconstruct_loss,
     }
 
 
@@ -218,11 +269,12 @@ def generation_loss(model, human_embed, agent_embed, question_embed):
     ahh_style, ahh_content, ahh_context = model.encode(ahh_embed)
 
     # Style classification
-    hah_style_loss = compute_style_loss(model, hah_style, human_style_label)
-    aha_style_loss = compute_style_loss(model, aha_style, agent_style_label)
-    haa_style_loss = compute_style_loss(model, haa_style, human_style_label)
-    ahh_style_loss = compute_style_loss(model, ahh_style, agent_style_label)
-    style_loss = (hah_style_loss + aha_style_loss + haa_style_loss + ahh_style_loss) / 4
+    style_loss = (
+        compute_style_loss(model, hah_style, human_style_label) +
+        compute_style_loss(model, aha_style, agent_style_label) +
+        compute_style_loss(model, haa_style, human_style_label) +
+        compute_style_loss(model, ahh_style, agent_style_label)
+    ) / 4
 
     # Content consistency
     ca, ch = content_agent.detach(), content_human.detach()
@@ -232,13 +284,20 @@ def generation_loss(model, human_embed, agent_embed, question_embed):
         F.mse_loss(haa_content, ca) +
         F.mse_loss(ahh_content, ch)
     ) / 4
+    # content_loss = (
+    #     compute_content_loss(model, hah_content, ca)["total_loss"] +
+    #     compute_content_loss(model, aha_content, ch)["total_loss"] +
+    #     compute_content_loss(model, haa_content, ca)["total_loss"] +
+    #     compute_content_loss(model, ahh_content, ch)["total_loss"]
+    # ) / 4
 
     # Context reconstruction
-    hah_context_loss = compute_context_loss(model, hah_context, question_embed)["total_loss"]
-    aha_context_loss = compute_context_loss(model, aha_context, question_embed)["total_loss"]
-    haa_context_loss = compute_context_loss(model, haa_context, question_embed)["total_loss"]
-    ahh_context_loss = compute_context_loss(model, ahh_context, question_embed)["total_loss"]
-    context_loss = (hah_context_loss + aha_context_loss + haa_context_loss + ahh_context_loss) / 4
+    context_loss = (
+        compute_context_loss(model, hah_context, question_embed)["total_loss"] +
+        compute_context_loss(model, aha_context, question_embed)["total_loss"] +
+        compute_context_loss(model, haa_context, question_embed)["total_loss"] +
+        compute_context_loss(model, ahh_context, question_embed)["total_loss"]
+    ) / 4
 
     # Combine objectives
     total_loss  = (

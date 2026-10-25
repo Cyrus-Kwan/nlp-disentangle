@@ -43,10 +43,6 @@ class StyleEncoder(nn. Module):
         self.mlp = nn.Sequential(
             nn.Linear(cfg.bert_dim, cfg.style_hidden),
             nn.GELU(),
-            nn.Linear(cfg.style_hidden, cfg.style_hidden),
-            nn.GELU(),
-            nn.Linear(cfg.style_hidden, cfg.style_hidden),
-            nn.GELU(),
             nn.Linear(cfg.style_hidden, cfg.style_dim)
         )
 
@@ -59,11 +55,7 @@ class ContentEncoder(nn. Module):
         super().__init__()
 
         self.mlp = nn.Sequential(
-            nn.Linear(cfg.bert_dim, 32),
-            nn.GELU(),
-            nn.Linear(32, cfg.content_hidden),
-            nn.GELU(),
-            nn.Linear(cfg.content_hidden, cfg.content_hidden),
+            nn.Linear(cfg.bert_dim, cfg.content_hidden),
             nn.GELU(),
             nn.Linear(cfg.content_hidden, cfg.content_dim)
         )
@@ -77,11 +69,7 @@ class ContextEncoder(nn. Module):
         super().__init__()
 
         self.mlp = nn.Sequential(
-            nn.Linear(cfg.bert_dim, 32),
-            nn.GELU(),
-            nn.Linear(32, cfg.content_hidden),
-            nn.GELU(),
-            nn.Linear(cfg.content_hidden, cfg.content_hidden),
+            nn.Linear(cfg.bert_dim, cfg.context_hidden),
             nn.GELU(),
             nn.Linear(cfg.content_hidden, cfg.context_dim)
         )
